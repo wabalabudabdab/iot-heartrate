@@ -1,107 +1,152 @@
 #include <Arduino.h>
-#include <BLE2902.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
-#include <BLEUUID.h>
 #include <BLEUtils.h>
+#include <BLE2902.h>
 
-#include "MAX30100_PulseOximeter.h"
+MAX30105 particleSensor;
 
-#define REPORTING_PERIOD_MS 500
+// BLE характеристики
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
 
-PulseOximeter pox;
-uint32_t tsLastReport = 0;
+// UUID для сервиса и характеристики
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-// https://www.bluetooth.com/specifications/gatt/
-// https://www.bluetooth.com/specifications/gatt/services/
-// https://www.bluetooth.com/specifications/gatt/characteristics/
+// Класс для обработки событий BLE
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+    };
 
-// PLXS	Pulse Oximeter Service
-static const BLEUUID blePLXServiceUUID(0x1822U);
-static const BLEUUID blePLXContMeasUUID(0x2A5FU);
-static const BLEUUID blePLXSpotCheckMeasUUID(0x2A5EU);
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+    }
+};
 
-static BLEServer *bleServer;
-static BLEService *bleService;
-static BLECharacteristic *blePLXContMeasChar;
+// Данные для пульса
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute;
+int beatAvg;
 
-void setup_oximeter(void) {
-  Serial.print("Initializing pulse oximeter..");
-
-  if (!pox.begin()) {
-    Serial.println("FAILED");
-    for (;;)
-      ;
-  } else {
-    Serial.println("SUCCESS");
-  }
-}
-
-void setup_ble_gatts(void) {
-  BLEDevice::init("MyKi Oxi");
-  bleServer = BLEDevice::createServer();
-
-  bleService = bleServer->createService(blePLXServiceUUID);
-
-  blePLXContMeasChar = bleService->createCharacteristic(
-      blePLXContMeasUUID,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  blePLXContMeasChar->addDescriptor(new BLE2902());
-  bleService->start();
-
-  BLEAdvertising *bleAdv = BLEDevice::getAdvertising();
-  bleAdv->addServiceUUID(blePLXServiceUUID);
-  bleAdv->setScanResponse(true);
-  
-  // functions that help with iPhone connections issue
-  bleAdv->setMinPreferred(0x06);
-  bleAdv->setMinPreferred(0x12);
-  
-  BLEDevice::startAdvertising();
-}
-
-void update(float hrf, float spo2f) {
-  uint16_t tmp;
-  uint8_t plxValue[5];
-
-  plxValue[0] = 0x00;
-
-  tmp = (uint16_t)round(spo2f);
-  plxValue[1] = tmp & 0xff;
-  plxValue[2] = (tmp >> 8) & 0xff;
-
-  tmp = (uint16_t)round(hrf);
-  plxValue[3] = tmp & 0xff;
-  plxValue[4] = (tmp >> 8) & 0xff;
-
-  blePLXContMeasChar->setValue(plxValue, sizeof(plxValue));
-  blePLXContMeasChar->notify();
-}
+const int BUFFER_SIZE = 100;
+long irBuffer[BUFFER_SIZE];
+long redBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
 
 void setup() {
-  Serial.begin(115200);
-  setup_ble_gatts();
-  setup_oximeter();
+    Serial.begin(115200);
+    Wire.begin(21, 22);
+    Wire.setClock(400000);
+    
+    if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+        Serial.println("Sensor not found! Check wiring:");
+        Serial.println("1. VIN -> 3.3V");
+        Serial.println("2. GND -> GND");
+        Serial.println("3. SDA -> GPIO21");
+        Serial.println("4. SCL -> GPIO22");
+        while (1) {
+            Serial.println("Waiting for reset...");
+            delay(1000);
+        }
+    }
+    
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x0A);
+    particleSensor.setPulseAmplitudeGreen(0);
+
+    // Инициализация BLE
+    BLEDevice::init("PulseSensor");
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+    
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+    pCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pCharacteristic->addDescriptor(new BLE2902());
+    pService->start();
+    
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(false);
+    pAdvertising->setMinPreferred(0x0);
+    BLEDevice::startAdvertising();
+    Serial.println("BLE started");
 }
 
 void loop() {
-  // Make sure to call update as fast as possible
-  pox.update();
+    irBuffer[bufferIndex] = particleSensor.getIR();
+    redBuffer[bufferIndex] = particleSensor.getRed();
+    bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
 
-  // Asynchronously dump heart rate and oxidation levels to the serial
-  // For both, a value of 0 means "invalid"
-  if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
-    float hr = pox.getHeartRate();
-    float spo2 = pox.getSpO2();
+    if (checkForBeat(irBuffer[(bufferIndex - 1) % BUFFER_SIZE]) == true) {
+        long delta = millis() - lastBeat;
+        lastBeat = millis();
 
-    Serial.print("Heart rate:");
-    Serial.print(hr);
-    Serial.print("bpm / SpO2:");
-    Serial.print(spo2);
-    Serial.println("%");
+        if (delta > 200 && delta < 2000) {
+            beatsPerMinute = 60000.0 / delta;
 
-    tsLastReport = millis();
+            if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+                rates[rateSpot++] = (byte)beatsPerMinute;
+                rateSpot %= RATE_SIZE;
 
-    update(hr, spo2);
-  }
+                beatAvg = 0;
+                int count = 0;
+                for (byte x = 0; x < RATE_SIZE; x++) {
+                    if (rates[x] > 0) {
+                        beatAvg += rates[x];
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    beatAvg /= count;
+                }
+            }
+        }
+    }
+
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint >= 1000) {
+        lastPrint = millis();
+        
+        // Формируем строку для отправки
+        String dataString = String(irBuffer[(bufferIndex - 1) % BUFFER_SIZE]) + "," +
+                          String(redBuffer[(bufferIndex - 1) % BUFFER_SIZE]) + "," +
+                          String((int)beatsPerMinute) + "," +
+                          String(beatAvg) + "," +
+                          String(irBuffer[(bufferIndex - 1) % BUFFER_SIZE] < 50000 ? 0 : 1);
+        
+        // Отправляем данные через BLE
+        if (deviceConnected) {
+            pCharacteristic->setValue(dataString.c_str());
+            pCharacteristic->notify();
+        }
+        
+        // Выводим в Serial для отладки
+        Serial.println(dataString);
+    }
+
+    // Обработка отключения BLE
+    if (!deviceConnected && oldDeviceConnected) {
+        delay(500);
+        pServer->startAdvertising();
+        oldDeviceConnected = deviceConnected;
+    }
+    if (deviceConnected && !oldDeviceConnected) {
+        oldDeviceConnected = deviceConnected;
+    }
+
+    delay(20);
 }
