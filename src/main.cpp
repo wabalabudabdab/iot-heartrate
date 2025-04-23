@@ -1,22 +1,29 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include "MAX30105.h"
-#include "heartRate.h"
+#include "spo2_algorithm.h"
 
 MAX30105 particleSensor;
 
-const byte RATE_SIZE = 8;
-byte rates[RATE_SIZE];
-byte rateSpot = 0;
-long lastBeat = 0;
-float beatsPerMinute;
-int beatAvg;
-float spO2;
+uint32_t irBuffer[100]; // инфракрасные данные
+uint32_t redBuffer[100]; // красные данные
 
-const int BUFFER_SIZE = 100;
-long irBuffer[BUFFER_SIZE];
-long redBuffer[BUFFER_SIZE];
-int bufferIndex = 0;
+int32_t bufferLength = 100;
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRate;
+int8_t validHeartRate;
+
+// Переменные для пульса
+int lastValidBPM = 0;
+unsigned long lastBPMUpdate = 0;
+const unsigned long BPM_UPDATE_INTERVAL = 5000; // 5 секунд
+
+// Переменные для SpO2
+int lastValidSpO2 = 0;
+
+// Флаг наличия пальца
+bool fingerDetected = false;
 
 void setup() {
     Serial.begin(115200);
@@ -35,87 +42,76 @@ void setup() {
         }
     }
     
-    particleSensor.setup();
-    particleSensor.setPulseAmplitudeRed(0x0A);
-    particleSensor.setPulseAmplitudeGreen(0);
+    // Настройка датчика
+    byte ledBrightness = 50;
+    byte sampleAverage = 1;
+    byte ledMode = 2;
+    byte sampleRate = 100;
+    int pulseWidth = 69;
+    int adcRange = 4096;
     
-    for (byte x = 0; x < RATE_SIZE; x++) {
-        rates[x] = 0;
-    }
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
 }
 
 void loop() {
-    irBuffer[bufferIndex] = particleSensor.getIR();
-    redBuffer[bufferIndex] = particleSensor.getRed();
-    bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
-
-    // Расчет SpO2
-    float redAC = 0;
-    float irAC = 0;
-    float redDC = 0;
-    float irDC = 0;
-    
-    for(int i = 0; i < BUFFER_SIZE; i++) {
-        redDC += redBuffer[i];
-        irDC += irBuffer[i];
-    }
-    redDC /= BUFFER_SIZE;
-    irDC /= BUFFER_SIZE;
-    
-    for(int i = 0; i < BUFFER_SIZE; i++) {
-        redAC += pow(redBuffer[i] - redDC, 2);
-        irAC += pow(irBuffer[i] - irDC, 2);
-    }
-    redAC = sqrt(redAC / BUFFER_SIZE);
-    irAC = sqrt(irAC / BUFFER_SIZE);
-    
-    float ratio = (redAC / redDC) / (irAC / irDC);
-    spO2 = 110 - 25 * ratio;
-
-    if (irBuffer[(bufferIndex - 1) % BUFFER_SIZE] > 50000) {
-        if (checkForBeat(irBuffer[(bufferIndex - 1) % BUFFER_SIZE]) == true) {
-            long delta = millis() - lastBeat;
-            lastBeat = millis();
-
-            if (delta > 200 && delta < 2000) {
-                beatsPerMinute = 60000.0 / delta;
-                rates[rateSpot++] = (byte)beatsPerMinute;
-                rateSpot %= RATE_SIZE;
-
-                beatAvg = 0;
-                int count = 0;
-                for (byte x = 0; x < RATE_SIZE; x++) {
-                    if (rates[x] > 0) {
-                        beatAvg += rates[x];
-                        count++;
-                    }
+    static unsigned long lastSample = 0;
+    if (millis() - lastSample >= 20) { // 50 Гц
+        lastSample = millis();
+        
+        // Сдвигаем буфер
+        for (byte i = 1; i < bufferLength; i++) {
+            redBuffer[i-1] = redBuffer[i];
+            irBuffer[i-1] = irBuffer[i];
+        }
+        
+        // Добавляем новый сэмпл
+        while (particleSensor.available() == false)
+            particleSensor.check();
+            
+        redBuffer[bufferLength-1] = particleSensor.getRed();
+        irBuffer[bufferLength-1] = particleSensor.getIR();
+        particleSensor.nextSample();
+        
+        // Проверяем наличие пальца
+        bool currentFinger = irBuffer[bufferLength-1] > 50000;
+        
+        // Если палец убрали, сбрасываем значения
+        if (fingerDetected && !currentFinger) {
+            lastValidBPM = 0;
+            lastValidSpO2 = 0;
+        }
+        fingerDetected = currentFinger;
+        
+        // Рассчитываем SpO2 и пульс только если палец на датчике
+        if (fingerDetected) {
+            maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+            
+            // Обновляем SpO2 если валидно
+            if (validSPO2 == 1 && spo2 > 0 && spo2 < 100) {
+                lastValidSpO2 = spo2;
+            }
+            
+            // Обновляем пульс каждые 5 секунд если валидно
+            if (millis() - lastBPMUpdate >= BPM_UPDATE_INTERVAL) {
+                if (validHeartRate == 1 && heartRate > 40 && heartRate < 200) {
+                    lastValidBPM = heartRate;
                 }
-                if (count > 0) {
-                    beatAvg /= count;
-                }
+                lastBPMUpdate = millis();
             }
         }
-    } else {
-        beatsPerMinute = 0;
-        beatAvg = 0;
-    }
-
-    static unsigned long lastPrint = 0;
-    if (millis() - lastPrint >= 1000) {
-        lastPrint = millis();
+        
+        // Выводим результаты
         Serial.print("IR: ");
-        Serial.print(irBuffer[(bufferIndex - 1) % BUFFER_SIZE]);
+        Serial.print(irBuffer[bufferLength-1]);
         Serial.print(" RED: ");
-        Serial.print(redBuffer[(bufferIndex - 1) % BUFFER_SIZE]);
-        Serial.print(" BPM: ");
-        Serial.print((int)beatsPerMinute);
-        Serial.print(" AVG: ");
-        Serial.print(beatAvg);
+        Serial.print(redBuffer[bufferLength-1]);
         Serial.print(" SpO2: ");
-        Serial.print((int)spO2);
-        Serial.print("% FINGER: ");
-        Serial.println(irBuffer[(bufferIndex - 1) % BUFFER_SIZE] < 50000 ? 0 : 1);
+        Serial.print(lastValidSpO2);
+        Serial.print("% HR: ");
+        Serial.print(lastValidBPM);
+        Serial.print(" SpO2Valid: ");
+        Serial.print(validSPO2);
+        Serial.print(" HRValid: ");
+        Serial.println(validHeartRate);
     }
-
-    delay(20);
 }
