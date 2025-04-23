@@ -2,41 +2,16 @@
 #include <Wire.h>
 #include "MAX30105.h"
 #include "heartRate.h"
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
 
 MAX30105 particleSensor;
 
-// BLE характеристики
-BLEServer* pServer = NULL;
-BLECharacteristic* pCharacteristic = NULL;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
-
-// UUID для сервиса и характеристики
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-
-// Класс для обработки событий BLE
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-        deviceConnected = true;
-    };
-
-    void onDisconnect(BLEServer* pServer) {
-        deviceConnected = false;
-    }
-};
-
-// Данные для пульса
-const byte RATE_SIZE = 4;
+const byte RATE_SIZE = 8;
 byte rates[RATE_SIZE];
 byte rateSpot = 0;
 long lastBeat = 0;
 float beatsPerMinute;
 int beatAvg;
+float spO2;
 
 const int BUFFER_SIZE = 100;
 long irBuffer[BUFFER_SIZE];
@@ -63,27 +38,10 @@ void setup() {
     particleSensor.setup();
     particleSensor.setPulseAmplitudeRed(0x0A);
     particleSensor.setPulseAmplitudeGreen(0);
-
-    // Инициализация BLE
-    BLEDevice::init("PulseSensor");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
     
-    BLEService *pService = pServer->createService(SERVICE_UUID);
-    pCharacteristic = pService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        BLECharacteristic::PROPERTY_READ |
-        BLECharacteristic::PROPERTY_NOTIFY
-    );
-    pCharacteristic->addDescriptor(new BLE2902());
-    pService->start();
-    
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->setScanResponse(false);
-    pAdvertising->setMinPreferred(0x0);
-    BLEDevice::startAdvertising();
-    Serial.println("BLE started");
+    for (byte x = 0; x < RATE_SIZE; x++) {
+        rates[x] = 0;
+    }
 }
 
 void loop() {
@@ -91,14 +49,36 @@ void loop() {
     redBuffer[bufferIndex] = particleSensor.getRed();
     bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
 
-    if (checkForBeat(irBuffer[(bufferIndex - 1) % BUFFER_SIZE]) == true) {
-        long delta = millis() - lastBeat;
-        lastBeat = millis();
+    // Расчет SpO2
+    float redAC = 0;
+    float irAC = 0;
+    float redDC = 0;
+    float irDC = 0;
+    
+    for(int i = 0; i < BUFFER_SIZE; i++) {
+        redDC += redBuffer[i];
+        irDC += irBuffer[i];
+    }
+    redDC /= BUFFER_SIZE;
+    irDC /= BUFFER_SIZE;
+    
+    for(int i = 0; i < BUFFER_SIZE; i++) {
+        redAC += pow(redBuffer[i] - redDC, 2);
+        irAC += pow(irBuffer[i] - irDC, 2);
+    }
+    redAC = sqrt(redAC / BUFFER_SIZE);
+    irAC = sqrt(irAC / BUFFER_SIZE);
+    
+    float ratio = (redAC / redDC) / (irAC / irDC);
+    spO2 = 110 - 25 * ratio;
 
-        if (delta > 200 && delta < 2000) {
-            beatsPerMinute = 60000.0 / delta;
+    if (irBuffer[(bufferIndex - 1) % BUFFER_SIZE] > 50000) {
+        if (checkForBeat(irBuffer[(bufferIndex - 1) % BUFFER_SIZE]) == true) {
+            long delta = millis() - lastBeat;
+            lastBeat = millis();
 
-            if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+            if (delta > 200 && delta < 2000) {
+                beatsPerMinute = 60000.0 / delta;
                 rates[rateSpot++] = (byte)beatsPerMinute;
                 rateSpot %= RATE_SIZE;
 
@@ -115,37 +95,26 @@ void loop() {
                 }
             }
         }
+    } else {
+        beatsPerMinute = 0;
+        beatAvg = 0;
     }
 
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint >= 1000) {
         lastPrint = millis();
-        
-        // Формируем строку для отправки
-        String dataString = String(irBuffer[(bufferIndex - 1) % BUFFER_SIZE]) + "," +
-                          String(redBuffer[(bufferIndex - 1) % BUFFER_SIZE]) + "," +
-                          String((int)beatsPerMinute) + "," +
-                          String(beatAvg) + "," +
-                          String(irBuffer[(bufferIndex - 1) % BUFFER_SIZE] < 50000 ? 0 : 1);
-        
-        // Отправляем данные через BLE
-        if (deviceConnected) {
-            pCharacteristic->setValue(dataString.c_str());
-            pCharacteristic->notify();
-        }
-        
-        // Выводим в Serial для отладки
-        Serial.println(dataString);
-    }
-
-    // Обработка отключения BLE
-    if (!deviceConnected && oldDeviceConnected) {
-        delay(500);
-        pServer->startAdvertising();
-        oldDeviceConnected = deviceConnected;
-    }
-    if (deviceConnected && !oldDeviceConnected) {
-        oldDeviceConnected = deviceConnected;
+        Serial.print("IR: ");
+        Serial.print(irBuffer[(bufferIndex - 1) % BUFFER_SIZE]);
+        Serial.print(" RED: ");
+        Serial.print(redBuffer[(bufferIndex - 1) % BUFFER_SIZE]);
+        Serial.print(" BPM: ");
+        Serial.print((int)beatsPerMinute);
+        Serial.print(" AVG: ");
+        Serial.print(beatAvg);
+        Serial.print(" SpO2: ");
+        Serial.print((int)spO2);
+        Serial.print("% FINGER: ");
+        Serial.println(irBuffer[(bufferIndex - 1) % BUFFER_SIZE] < 50000 ? 0 : 1);
     }
 
     delay(20);
